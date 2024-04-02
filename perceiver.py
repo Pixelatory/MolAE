@@ -41,6 +41,7 @@ class PerceiverBART(nn.Module):
                  dropout: float, pre_norm: bool = False,
                  activation_fn: nn.Module = nn.ReLU,
                  norm_fn: nn.Module = nn.LayerNorm,
+                 average_latent: bool = False,
                  bias: bool = True, pad_token_idx: int = 0):
         super().__init__()
         # DECODER
@@ -75,7 +76,12 @@ class PerceiverBART(nn.Module):
         
         # TODO: find out what num_latent_vecs is
         # LATENT
+        self.average_latent = average_latent
         self.latent = nn.Parameter(torch.randn(n_latent_vecs, latent_dim))
+
+        self.lm_head = nn.Sequential(
+            nn.Linear(d_model, vocab_size, bias=bias)
+        )
 
     def forward(self, x, mask=None):
         x_emb = self.embedding(x)
@@ -88,12 +94,15 @@ class PerceiverBART(nn.Module):
             memory = [layer(*memory, mask=mask)]
         memory = memory[0]
 
+        if self.average_latent:
+            memory = torch.mean(memory, dim=1).unsqueeze(1)
+
         out = [memory, x_emb]
         for layer in self.decoder_layers:
             out = [memory, layer(*out)]
         out = out[1]
 
-        return out
+        return self.lm_head(out)
 
 
 class PerceiverBARTVAE(PerceiverBART):

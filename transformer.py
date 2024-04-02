@@ -133,7 +133,7 @@ class TransformerDecoderLayer(nn.Module):
         """
         # self-attention followed by feedforward on tgt tensor
         residual = tgt
-        tgt = self.norm1(x) if self.pre_norm else tgt
+        tgt = self.norm1(tgt) if self.pre_norm else tgt
         tgt = residual + self.dropout(self.attention(tgt, tgt, tgt, mask=self_attn_mask))
         tgt = self.norm1(tgt) if not self.pre_norm else tgt
 

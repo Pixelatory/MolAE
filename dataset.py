@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Dict, List, Union
+from typing import Dict, List, Tuple, Union
 import re
 from rdkit import Chem
 import numpy as np
@@ -14,6 +14,8 @@ import pyarrow.parquet as pq
 from tqdm import tqdm
 import multiprocessing as mp
 import random
+import torch.nn.functional as F
+
 try:
     import selfies as sf
 except ImportError:
@@ -76,7 +78,7 @@ def encode_seq(seq: str, model_str2num: Dict[str, int], vocab_str2num: Dict[str,
         append_tokens = []
     encoded_prepend = [encode_token(token, model_str2num, vocab_str2num, unk_token) for token in prepend_tokens]
     encoded_append = [encode_token(token, model_str2num, vocab_str2num, unk_token) for token in append_tokens]
-    encoded_seq = [encode_token(token, model_str2num, vocab_str2num, unk_token) for token in tokenize_molecule(seq, kwargs)]
+    encoded_seq = [encode_token(token, model_str2num, vocab_str2num, unk_token) for token in tokenize_molecule(seq, **kwargs)]
     return encoded_prepend + encoded_seq + encoded_append
 
 
@@ -95,64 +97,16 @@ def canonical_smiles(smi):
     return smiles
 
 
-class SmilesDataset(Dataset):
-    def __init__(self, dataset_path, smiles_col: str, tasks_cols: Union[str, List[str]], model_str2num, smiles_str2num, use_dask=False):
-        cols = []
-        if type(tasks_cols) is list:
-            cols = tasks_cols
-            cols.append(smiles_col)
-        else:
-            cols = [smiles_col, tasks_cols]
-        
-        if use_dask:
-            df = dd.read_csv(dataset_path, usecols=cols)
-        else:
-            df = pd.read_csv(dataset_path, usecols=cols)
-        
+class CSVDataset:
+    def __init__(self, dataset_path) -> None:
+        self.data = pd.read_csv(dataset_path)
+    
+    def __getitem__(self, idx) -> str:
+        return self.data.iloc[idx]
 
-        self.model_str2num = model_str2num
-        self.smiles_str2num = smiles_str2num
-
-        if not path.endswith('pkl'):
-            self.data = self.df[Smiles_head].to_numpy().reshape(-1).tolist()
-            self.data = [self._char_to_idx(entry) for entry in tqdm(self.data)]
-
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.data)
-
-    def __getitem__(self, item):
-        smiles = self.data[item]
-        x, y, weights = self.numerical_smiles(smiles)
-        return x, y, weights
-
-    def numerical_smiles(self, smiles):
-        # nums_list = self._char_to_idx(smiles)
-        nums_list = smiles  # smiles is really the encoding
-        choices = np.random.permutation(len(nums_list) - 1)[:int(len(nums_list) * 0.15)] + 1
-        y = np.array(nums_list).astype('int64')
-        weight = np.zeros(len(nums_list))
-        for i in choices:
-            rand = np.random.rand()
-            weight[i] = 1
-            if rand < 0.8:
-                nums_list[i] = self.model_str2num['[UNK]']
-            elif rand < 0.9:
-                if self.fragmentation:
-                    nums_list[i] = int(
-                        np.random.randint(len(self.model_str2num), len(self.smiles_str2num) + len(self.frag_str2num)))
-                else:
-                    nums_list[i] = int(np.random.randint(len(self.model_str2num), len(self.smiles_str2num)))
-        x = np.array(nums_list).astype('int64')
-        weights = weight.astype('float32')
-        return x, y, weights
-
-    def _char_to_idx(self, seq, prepend=None, append=None):
-        encoding = encode_molecule(seq, self.model_str2num, self.smiles_str2num)
-        return prepend + encoding + append
-
-    def pickle_data_to_file(self, file_name):
-        with open(file_name, 'wb') as f:
-            pickle.dump(self.data, f)
+    
 
 class ParquetDataset:
     def __init__(self, dataset_path) -> None:
@@ -168,9 +122,9 @@ class ParquetDataset:
         return pd.concat([self.get_partition(idx) for idx in idxs])
 
 
-class ParquetDataLoader:
+class SMILESDataLoader:
     def __init__(self, 
-                 dataset: ParquetDataset,
+                 dataset: Union[ParquetDataset, CSVDataset],
                  model_str2num: Dict[str, int],
                  vocab_str2num: Dict[str, int],
                  smiles_col: str = 'smiles', 
@@ -182,13 +136,15 @@ class ParquetDataLoader:
                  mlm_prob_token_random: float = 0.1,
                  mlm_mask_token: str = "[MASK]",
                  n_partitions_loaded: int = 10,
-                 random_state: int = 42,
+                 random_state: int = None,
                  model_unk_token: str = "[UNK]",
                  append_tokens_to_seq: Union[str, List[str]] = None,
-                 prepend_tokens_to_seq: Union[str, List[str]] = None):
+                 prepend_tokens_to_seq: Union[str, List[str]] = None,
+                 collate_fns: List = None):
         """
             Note: By default assumes masked language modelling task, however if mlm_prob_overall=0, then assumes language modelling task.
         """
+        # EXCEPTION CHECKING
         if mlm_prob_overall > 1.0:
             raise Exception("Masked language modelling token selection probability cannot be > 1.0")
         if mlm_prob_token_mask + mlm_prob_token_random > 1.0:
@@ -199,13 +155,23 @@ class ParquetDataLoader:
         if n_partitions_loaded <= 0:
             raise Exception("Number of loaded partitions must be > 0")
         
+        if collate_fns is None:
+            collate_fns = []
+
         # DATASET VARIABLES
         self.dataset = dataset
         self.shuffle = shuffle
         self.batch_size = batch_size
-        self.n_partitions_loaded = n_partitions_loaded
-        self.partition_idxs = [i for i in range(self.dataset.n_partitions())]
         self.smiles_col = smiles_col
+        self.collate_fns = collate_fns
+
+        if type(dataset) is ParquetDataset:
+            self.n_partitions_loaded = n_partitions_loaded
+            self.partition_idxs = [i for i in range(self.dataset.n_partitions())]
+        elif type(dataset) is CSVDataset:
+            self.sample_idxs = [i for i in range(len(self.dataset))]
+        else:
+            raise Exception("Either ParquetDataset or CSVDataset is expected.")
 
         # VOCABULARY & RANDOM GENERATOR VARIABLES
         self.model_str2num = model_str2num
@@ -233,38 +199,64 @@ class ParquetDataLoader:
     def __iter__(self):
         loaded_data = []
         if self.shuffle:
-            self.generator.shuffle(self.partition_idxs)
+            if type(self.dataset) is ParquetDataset:
+                self.generator.shuffle(self.partition_idxs)
+            else:
+                self.generator.shuffle(self.sample_idxs)
 
-        for i in range(0, len(self.partition_idxs), self.n_partitions_loaded):
-            # load up n partitions
-            partition_start = i
-            partition_end = min(partition_start + self.n_partitions_loaded, len(self.partition_idxs))
+        if type(self.dataset) is ParquetDataset:
+            for i in range(0, len(self.partition_idxs), self.n_partitions_loaded):
+                # load up n partitions
+                partition_start = i
+                partition_end = min(partition_start + self.n_partitions_loaded, len(self.partition_idxs))
 
-            selected_partitions = [self.partition_idxs[i] for i in range(partition_start, partition_end)]
-            loaded_partitions = self.dataset.load_partitions(selected_partitions)
-            loaded_partitions = loaded_partitions[self.smiles_col].tolist()
+                selected_partitions = [self.partition_idxs[i] for i in range(partition_start, partition_end)]
+                loaded_partitions = self.dataset.load_partitions(selected_partitions)
+                loaded_partitions = loaded_partitions[self.smiles_col].tolist()
 
-            # shuffle SMILES strings in partitions
-            if self.shuffle:
-                self.generator.shuffle(loaded_partitions)
+                # shuffle SMILES strings in partitions
+                if self.shuffle:
+                    self.generator.shuffle(loaded_partitions)
 
-            loaded_data += loaded_partitions
-            for i in range(0, len(loaded_data), self.batch_size):
-                batch = loaded_data[i:i+self.batch_size]
-                if len(batch) < self.batch_size:
-                    # any remaining data that doesn't fit into batch is used at start of next load of partition data
-                    loaded_data = batch
-                else:
-                    batch = [self._encode_seq(smi) for smi in batch]
-                    if self.mlm_prob_overall == 0:
-                        yield [self._lm_procedure(encoded_seq) for encoded_seq in batch]
+                loaded_data += loaded_partitions
+                for i in range(0, len(loaded_data), self.batch_size):
+                    batch = loaded_data[i:i+self.batch_size]
+                    if len(batch) < self.batch_size:
+                        # any remaining data that doesn't fit into batch is used at start of next load of partition data
+                        loaded_data = batch
                     else:
-                        yield [self._mlm_procedure(encoded_seq) for encoded_seq in batch]
+                        encoded_seqs = [self._encode_seq(smi) for smi in batch]
+                        if self.mlm_prob_overall == 0:
+                            batch = [self._lm_procedure(encoded_seq) for encoded_seq in encoded_seqs]
+                            for collate_fn in self.collate_fns:
+                                batch = collate_fn(batch)
+                            yield batch
+                        else:
+                            batch = [self._mlm_procedure(encoded_seq) for encoded_seq in encoded_seqs]
+                            for collate_fn in self.collate_fns:
+                                batch = collate_fn(batch)
+                            yield batch
+        else:
+            # CSVDataset
+            for i in range(0, len(self.sample_idxs), self.batch_size):
+                batch_idxs = self.sample_idxs[i:i+self.batch_size]
+                seqs = self.dataset[batch_idxs][self.smiles_col].tolist()
+                encoded_seqs = [self._encode_seq(smi) for smi in seqs]
+                if self.mlm_prob_overall == 0:
+                    batch = [self._lm_procedure(encoded_seq) for encoded_seq in encoded_seqs]
+                    for collate_fn in self.collate_fns:
+                        batch = collate_fn(batch)
+                    yield batch
+                else:
+                    batch = [self._mlm_procedure(encoded_seq) for encoded_seq in encoded_seqs]
+                    for collate_fn in self.collate_fns:
+                        batch = collate_fn(batch)
+                    yield batch
 
-    def _encode_seq(self, seq: str):
+    def _encode_seq(self, seq: str) -> List[int]:
         return encode_seq(seq, self.model_str2num, self.vocab_str2num, self.prepend, self.append, unk_token=self.model_unk_token, use_selfies=self.use_selfies)
     
-    def _mlm_procedure(self, encoded_seq: List[int]):
+    def _mlm_procedure(self, encoded_seq: List[int]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
             Masked language modelling procedure on an encoded sequence.
         """
@@ -279,12 +271,12 @@ class ParquetDataLoader:
             if rand < self.mlm_prob_token_mask:
                 x[i] = self.model_str2num[self.mlm_mask_token]
             elif rand < self.mlm_prob_token_replace:
-                rand_vocab_idx = (len(self.vocab_str2num) - len(self.model_str2num)) * self.generator.random() + len(self.model_str2num)
-                x[i] = int(rand_vocab_idx)
+                rand_vocab_idx = self.generator.integers(0, len(self.model_str2num) + len(self.vocab_str2num))
+                x[i] = rand_vocab_idx
 
         return x, y, weights
     
-    def _lm_procedure(self, encoded_seq: List[int]):
+    def _lm_procedure(self, encoded_seq: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
             Language modelling procedure on an encoded sequence.
         """
@@ -292,15 +284,82 @@ class ParquetDataLoader:
         y = torch.tensor(encoded_seq, dtype=torch.int64)
         return x, y
 
+def pad_to_len(batch: List[Tuple[torch.Tensor]], pad_val: List, length: int = None, batch_seq_idx: int = None, seq_dim: int = 0) -> Tuple:
+    """
+    Pads a batch of tensors to a certain length, or to maximum tensor length.
+
+    Parameters:
+    - batch: Batch of tuple of tensors. E.g. (input sequence, output sequence, weights) in MLM task.
+    - batch_seq_idx: When length is none and padding to maximum length of tensor in batch, this \
+    parameter defines which batch index to find maximum length for.
+    - length: Length of the resulting tensors. If none, pads to maximum length of tensor in batch.
+    - pad_val: Padding values to add to tensors to make them the specified length. Length of list \
+    should be at most the length of each tuple in batch. If None value is used in pad_val, then that \
+    corresponding tensor in batch tuples will not be padded to length.
+    - seq_dim: Tensor dimension of the sequence to pad.
+    """
+    if length is None:
+        if batch_seq_idx is None:
+            raise Exception("batch_seq_idx cannot be none if length is none")
+        length = 0
+        for sample in batch:
+            length = max(length, sample[batch_seq_idx].shape[seq_dim])
+
+    n_batch_items = len(batch[0])
+    new_batch = [[] for _ in range(n_batch_items)]
+    for i in range(len(batch)):
+        for j in range(n_batch_items):
+            if j >= len(pad_val) or pad_val[j] is None:
+                new_batch[j].append(batch[i][j])
+            else:
+                new_shape = list(batch[i][j].shape)
+                new_shape[seq_dim] = length - new_shape[seq_dim]
+                pad_tensor = torch.full(size=new_shape, fill_value=pad_val[j])
+                new_batch[j].append(torch.concat([batch[i][j], pad_tensor], dim=seq_dim))
+    return new_batch
+
+def expand_tensor_dim(batch: List[List[torch.Tensor]], expand_idxs: Union[int, List[int]], expand_dim: int = 0):
+    if type(expand_idxs) is int:
+        expand_idxs = [expand_idxs]
+    
+    for i in range(len(batch)):
+        if i in expand_idxs:
+            for j in range(len(batch[i])):
+                batch[i][j] = torch.unsqueeze(batch[i][j], dim=expand_dim)
+    
+    return batch
+
+def concat_tensors(batch: List[List[torch.Tensor]], concat_idxs: Union[int, List[int]], concat_dim: int = 0):
+    """
+    Concatenate a batch of tensors together.
+    
+    Parameters:
+    - batch: Batch of list of tensors. E.g. (input sequence, output sequence, weights) in MLM task.
+    - concat_idxs: Batch indices of tensors to concatenate along concat_dim.
+    - concat_dim: Tensor dimension for concatenation.
+    """
+    if type(concat_idxs) is int:
+        concat_idxs = [concat_idxs]
+    
+    for i in range(len(batch)):
+        if i in concat_idxs:
+            batch[i] = torch.concat(batch[i], dim=concat_dim)
+    
+    return batch
+
 
 if __name__ == "__main__":
-    selfies_vocab = load_vocab_from_file('E:/ZINC-20-all/selfies_vocab.txt')
+    selfies_vocab = load_vocab_from_file('E:/MOLMIM/data/smiles_vocab.txt')
     model_str2num, selfies_str2num = get_encoders(selfies_vocab, ['[PAD]', '[UNK]', '[MASK]', '[CLS]'])
-    dataset = ParquetDataset('E:/ZINC-20-all/parquet')
-    dataloader = ParquetDataLoader(dataset, model_str2num, selfies_str2num, shuffle=True, use_selfies=True, n_partitions_loaded=10, batch_size=5, mlm_prob_overall=0.5, prepend_tokens_to_seq=['[CLS]'])
+    dataset = CSVDataset('E:/MOLMIM/data/allmolgen_255maxlen_cano.csv')
+    dataloader = SMILESDataLoader(dataset, model_str2num, selfies_str2num, shuffle=True, use_selfies=False, n_partitions_loaded=10, batch_size=5, prepend_tokens_to_seq=['[CLS]'])
 
     for batch in tqdm(dataloader):
-        print(batch)
+        batch = pad_to_len(batch, [0, 0, 0], batch_seq_idx=0, seq_dim=0)
+        for t in concat_tensors(expand_tensor_dim(batch, [0, 1, 2]), [0, 1, 2]):
+            print(t)
+        #print(batch.shape)
+        exit(1)
     
     exit(1)
     df = dd.read_parquet('E:/ZINC-20-all/parquet')

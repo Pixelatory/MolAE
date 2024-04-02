@@ -6,7 +6,7 @@ import multiprocessing as mp
 import selfies as sf
 import time
 
-SMI_REGEX_PATTERN = "(\[[^\]]+]|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#||\+|\\\\\/|:||@|\?|>|\*|\$|\%[0–9]{2}|[0-9])"
+from utils import SMI_REGEX_PATTERN
 
 active_processes = 0
 def dec_active_processes(*args):

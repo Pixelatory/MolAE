@@ -1,6 +1,8 @@
 from typing import Tuple
 import torch
 
+SMI_REGEX_PATTERN = "(\[[^\]]+]|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#||\+|\\\\\/|:||@|\?|>|\*|\$|\%[0–9]{2}|[0-9])"
+
 def create_causal_mask(batch_size: int, seq_len: int) -> torch.Tensor:
     """
     Creates a causal mask to work with the Transformer model

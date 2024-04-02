@@ -1,1 +1,7 @@
 __pycache__/
+/data/allmolgen_255maxlen_cano.csv
+/data/moses.tab
+/data/chembl_v29.csv
+/data/zinc.tab
+/data/smiles_vocab.txt
+/data/selfies_vocab.txt
