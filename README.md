@@ -1,2 +1,3 @@
-# MolMIM
-Implementation of MolMIM from https://arxiv.org/pdf/2208.09016.pdf
+# MolAE
+
+Still much work to be done, but implementing autoencoders specifically for molecular modelling.
