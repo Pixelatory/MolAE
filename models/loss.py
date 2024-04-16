@@ -23,4 +23,4 @@ def vae_loss(outputs: torch.Tensor, labels: torch.Tensor, log_var: torch.Tensor,
 def amim_loss(outputs: torch.Tensor, labels: torch.Tensor, z: torch.Tensor,
               weights: torch.Tensor = None, kld_weight: float = 1.):
     r_loss = recon_loss(outputs, labels, weights)
-    kld_loss = 
+    kld_loss = None

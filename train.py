@@ -1,7 +1,6 @@
 import torch.nn as nn
-from dataset import CSVDataset, SMILESDataLoader, concat_tensors, expand_tensor_dim, get_encoders, load_vocab_from_file, pad_to_len
-from loss import recon_loss
-from perceiver import PerceiverBART, PerceiverBARTVAE
+from dataset import CSVDataset, ConcatTensorCollator, ExpandTensorCollator, MaskedLanguageModellingCollator, PadToLenCollator, SMILESDataLoader, get_encoders, load_vocab_from_file
+from models.perceiver import PerceiverBART, PerceiverBARTVAE
 import torch
 import torch.nn.functional as F
 
@@ -27,16 +26,20 @@ if __name__ == "__main__":
 
     batch_size = 64
 
-    pad_fn = lambda x: pad_to_len(x, [0, 0], batch_seq_idx=0, seq_dim=0)
-    expand_fn = lambda x: expand_tensor_dim(x, [0, 1])
-    concat_fn = lambda x: concat_tensors(x, [0, 1])
+    vocab = load_vocab_from_file('data/selfies_vocab.txt')
+    model_str2num, vocab_str2num = get_encoders(vocab, ['[PAD]', '[UNK]', '[MASK]', '[CLS]'])
 
-    vocab = load_vocab_from_file('E:/MOLMIM/data/selfies_vocab.txt')
-    model_str2num, vocab_str2num = get_encoders(vocab, ['[PAD]', '[UNK]'])
-    dataset = CSVDataset('E:/MOLMIM/data/allmolgen_255maxlen_cano.csv')
+    mlm_collate = MaskedLanguageModellingCollator(mask_token_encoding=model_str2num['[MASK]'], 
+                                                  vocab_size=len(model_str2num) + len(vocab_str2num))
+    pad_collate = PadToLenCollator([model_str2num['[PAD]'], model_str2num['[PAD]'], 0])
+    expand_tensor_collate = ExpandTensorCollator()
+    concat_collate = ConcatTensorCollator()
+
+    dataset = CSVDataset('data/allmolgen_255maxlen_cano.csv')
     dataloader = SMILESDataLoader(dataset, model_str2num, vocab_str2num, shuffle=True, use_selfies=True, batch_size=batch_size,
-                                  mlm_prob_overall=0.0, collate_fns=[pad_fn, expand_fn, concat_fn])
+                                  collate_fns=[mlm_collate, pad_collate, expand_tensor_collate, concat_collate])
 
+    # TODO: Look into using memory transformer (REMTransformer?) for autoencoder
     
     model = PerceiverBARTVAE(len(model_str2num) + len(vocab_str2num), d_model, n_heads, n_encoder_layers, n_decoder_layers,
                           latent_dim, n_latent_vecs, dim_feedforward, weight_tie_layers, dropout, pre_norm, activation_fn,

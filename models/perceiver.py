@@ -2,10 +2,9 @@ import torch
 import torch.nn as nn
 from functools import wraps
 import torch.nn.functional as F
-from torchinfo import summary
 #from cond_pixelcnn.utils.nn import NonLinear
-from loss import recon_loss, vae_loss
-from transformer import TransformerDecoderLayer, TransformerEncoderLayer
+from models.loss import recon_loss, vae_loss
+from models.transformer import TransformerDecoderLayer, TransformerEncoderLayer
 from utils import reparameterize
 
 '''
@@ -122,15 +121,13 @@ class PerceiverBARTVAE(PerceiverBART):
                  activation_fn: nn.Module = nn.ReLU,
                  norm_fn: nn.Module = nn.LayerNorm,
                  average_latent: bool = False, bias: bool = True,
-                 kld_weight: float = 1., recon_weight: float = 1., 
-                 pad_token_idx: int = 0):
+                 kld_weight: float = 1., pad_token_idx: int = 0):
         super().__init__(vocab_size, d_model, n_heads, n_encoder_layers, 
                          n_decoder_layers, latent_dim, n_latent_vecs, 
                          dim_feedforward, weight_tie_layers, dropout,
                          pre_norm, activation_fn, norm_fn, average_latent, 
                          bias, pad_token_idx)
         self.kld_weight = kld_weight
-        self.recon_weight = recon_weight
         self.fc_mean = nn.Linear(latent_dim, latent_dim, bias=bias)
         self.fc_var = nn.Linear(latent_dim, latent_dim, bias=bias)
 
@@ -163,7 +160,7 @@ class PerceiverBARTVAE(PerceiverBART):
 
     def loss_function(self, outputs, labels, weights=None):
         outputs, _, mu, log_var = outputs
-        return vae_loss(outputs, labels, log_var, mu, weights, self.kld_weight, self.recon_weight)
+        return vae_loss(outputs, labels, log_var, mu, weights, self.kld_weight)
         
 class PerceiverBARTAMIM(PerceiverBARTVAE):
     def loss_function(self, x, mu, log_var, y):
@@ -171,17 +168,3 @@ class PerceiverBARTAMIM(PerceiverBARTVAE):
         # TODO: must get marginal prior q(x) = log(p(x|z)) + log(p(z)) - log(q(z|x)) = log decoder + log prior - log encoder
         recon_loss = F.cross_entropy(x, y)
         kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
-
-if __name__ == "__main__":
-    VOCAB = 30
-    HIDDEN = 256
-    NHEAD = 16
-    LAYERS = 512
-    BATCH = 10
-    SEQLEN = 26
-    '''
-    model = PerceiverBART(VOCAB, HIDDEN, NHEAD, LAYERS, LAYERS, 64, 5, 1024, False, 0.1)
-    summary(model)
-    src = torch.randint(low=0, high=VOCAB, size=(BATCH, SEQLEN))
-    print(model(src).shape)
-    '''

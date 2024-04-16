@@ -1,3 +1,4 @@
+import dataset
 import math
 import re
 import numpy as np
@@ -90,44 +91,163 @@ class AugmentSMILESTransform:
         return randomize_smiles(smi, generator=self.generator)
 
 
-class MaskedLanguageModellingCollator:
+class TextInfillingCollator:
+    def __init__(self, mask_token_encoding: int,
+                 prob_overall: float = 0.15,
+                 lam: int = 3,
+                 random_state: Union[int, np.random.Generator] = None) -> None:
+        """
+        From BART (https://arxiv.org/pdf/1910.13461.pdf):
+        A number of text spans are sampled, with span lengths drawn 
+        from a Poisson distribution. Each span is replaced with a 
+        single mask token. 0-length spans correspond to the insertion 
+        of mask tokens.
+
+        Parameters:
+        - mask_token_encoding: Encoding value for mask token in vocabulary
+        - prob_overall: Overall rate of tokens being selected for infilling \
+            (similar to masked language modelling rate)
+        - lam: lambda value for poisson distribution
+        """
+        self.mask_token_encoding = mask_token_encoding
+        self.prob_overall = prob_overall
+        self.lam = lam
+        self.generator = np.random.default_rng(random_state)
+    
+    def __call__(self, xs: List[List[int]], ys: List[List[int]] = None) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        if ys is None:
+            ys = []
+            append_to_ys = True
+        for i in range(len(xs)):
+            x = xs[i].copy()
+
+            max_mask_tokens = math.ceil(len(x) * self.prob_overall)
+            masked_tokens = 0
+
+            if not append_to_ys:
+                y = torch.tensor(ys[i], dtype=torch.int64)
+            else:
+                y = torch.tensor(xs[i], dtype=torch.int64)
+            
+            while masked_tokens < max_mask_tokens:
+                span_length = self.generator.poisson(self.lam)
+                start_index = self.generator.integers(0, len(x) - span_length)
+
+                x[start_index : start_index + span_length] = [self.mask_token_encoding]
+
+                masked_tokens += max(1, span_length)
+            
+            x = torch.tensor(x, dtype=torch.int64)
+
+            xs[i] = x
+            if append_to_ys:
+                ys.append(y)
+            else:
+                ys[i] = y
+
+        return xs, ys
+
+
+class TokenDeletionCollator:
+    def __init__(self, remove_percentage: float = 0.15,
+                   num_tokens_to_delete: int = None,
+                   random_state: np.random.Generator = None) -> None:
+        """
+            From BART (https://arxiv.org/pdf/1910.13461.pdf):
+            Random tokens are deleted from the input.
+
+            Parameters:
+            - remove_percentage: percent of tokens (relative to length of sequence) to be removed
+            - num_tokens_to_delete: exact number of tokens to remove from sequence
+        """
+        if remove_percentage is None and num_tokens_to_delete is None:
+            raise Exception("remove_percentage and num_tokens_to_delete cannot both be None")
+        
+        self.remove_percentage = remove_percentage
+        self.num_tokens_to_delete = num_tokens_to_delete
+        self.generator = np.random.default_rng(random_state)
+    
+    def __call__(self, xs: List[List[int]], ys: List[List[int]] = None) -> torch.Any:
+        if ys is None:
+            ys = []
+            append_to_ys = True
+        
+        for i in range(len(xs)):
+            x = np.array(xs[i], copy=True)
+            if self.remove_percentage is not None:
+                num_deleted_tokens = math.ceil(len(x) * self.remove_percentage)
+
+            remaining_tokens = len(x) - num_deleted_tokens
+
+            idxs = self.generator.permutation(np.arange(len(x)))[:remaining_tokens]
+            idxs = np.sort(idxs)
+
+            if not append_to_ys:
+                y = torch.tensor(ys[i], dtype=torch.int64)
+            else:
+                y = torch.tensor(xs[i], dtype=torch.int64)
+            
+            xs[i] = torch.tensor(x[idxs], dtype=torch.int64)
+            if append_to_ys:
+                ys.append(y)
+            else:
+                ys[i] = y
+
+        return xs, ys
+
+
+class TokenMaskingCollator:
     def __init__(self, 
                  mask_token_encoding: int,
                  vocab_size: int,
                  prob_overall: float = 0.15,
                  prob_token_mask: float = 0.8,
                  prob_token_random: float = 0.1,
+                 return_weights: bool = True,
                  random_state: Union[int, np.random.Generator] = None) -> None:
+        """
+        Token masking like BERT's masked language modelling.
+        """
         if prob_overall > 1.0:
-            raise Exception("Masked language modelling token selection probability cannot be > 1.0")
+            raise Exception("Token masking overall probability cannot be > 1.0")
         if prob_token_mask + prob_token_random > 1.0:
-            raise Exception(f"Probability of MLM token replacement with MASK token + probability \
-                            of replacing token with random from vocab cannot be > 1.0")
+            raise Exception(f"{prob_token_mask} + {prob_token_random} cannot be > 1.0")
         
         self.mask_token_encoding = mask_token_encoding
         self.vocab_size = vocab_size
         self.prob_overall = prob_overall
         self.prob_token_mask = prob_token_mask
         self.prob_token_random = prob_token_random
+        self.return_weights = return_weights
         self.generator = np.random.default_rng(random_state)
     
     def __call__(self, xs: List[List[int]], ys: List[List[int]] = None) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
-        weights = []
+        if self.return_weights:
+            weights = []
+        
+        if ys is None:
+            ys = []
+            append_to_ys = True
+
         for i in range(len(xs)):
             x = torch.tensor(xs[i], dtype=torch.int64)
             num_masked_tokens = math.ceil(len(x) * self.prob_overall)
             mask_idxs = self.generator.permutation(len(x))[:num_masked_tokens]
 
-            if ys is not None:
+            if not append_to_ys:
                 y = torch.tensor(ys[i], dtype=torch.int64)
             else:
                 y = torch.tensor(xs[i], dtype=torch.int64)
 
-            weight = torch.zeros(len(x), dtype=torch.float32)
+            if self.return_weights:
+                weight = torch.zeros(len(x), dtype=torch.float32)
 
             for mask_idx in mask_idxs:
                 rand = self.generator.random()
-                weight[mask_idx] = 1.0
+
+                if self.return_weights:
+                    weight[mask_idx] = 1.0
+
                 if rand < self.prob_token_mask:
                     x[mask_idx] = self.mask_token_encoding
                 elif rand < self.prob_token_random:
@@ -135,10 +255,17 @@ class MaskedLanguageModellingCollator:
                     x[mask_idx] = rand_vocab_idx
             
             xs[i] = x
-            ys[i] = y
-            weights.append(weight)
+            if append_to_ys:
+                ys.append(y)
+            else:
+                ys[i] = y
 
-        return xs, ys, weights
+            if self.return_weights:
+                weights.append(weight)
+
+        if self.return_weights:
+            return xs, ys, weights
+        return xs, ys
 
 
 class LanguageModellingCollator:
@@ -155,78 +282,91 @@ class LanguageModellingCollator:
 
 
 class PadToLenCollator:
-    def __init__(self, pad_val: List, length: int = None, batch_seq_idx: int = None, seq_dim: int = 0) -> None:
+    def __init__(self, pad_val: List, length: int = None, batch_seq_idx: int = 0, seq_dim: int = 0) -> None:
         """
         Pads a batch of tensors to a certain length, or to maximum tensor length.
 
         Parameters:
-        - batch: Batch of tuple of tensors. E.g. (input sequence, output sequence, weights) in MLM task.
-        - batch_seq_idx: When length is None and padding to maximum length of tensor in batch, this \
-        parameter defines which batch index to find maximum length for.
-        - length: Length of the resulting tensors. If None, pads to maximum length of tensor in batch.
         - pad_val: Padding values to add to tensors to make them the specified length. Length of list \
         should be at most the length of each tuple in batch. If None value is used in pad_val, then that \
         corresponding tensor in batch tuples will not be padded to length.
+        - length: Length of the resulting tensors. If None, pads to maximum length of tensor in batch.
+        - batch_seq_idx: When length is None and padding to maximum length of tensor in batch, this \
+        parameter defines which batch index to find maximum length for.
         - seq_dim: Tensor dimension of the sequence to pad.
         """
-        if length is None and batch_seq_idx is None:
-            raise Exception("batch_seq_idx cannot be none if length is none")
-        
         self.pad_val = pad_val
         self.length = length
         self.batch_seq_idx = batch_seq_idx
         self.seq_dim = seq_dim
     
-    def __call__(self, batch: Tuple[List[torch.Tensor]]):
+    def __call__(self, batch: Tuple[List[torch.Tensor]]) -> Tuple[List[torch.Tensor]]:
         if self.length is None:
             length = 0
             for sample in batch[self.batch_seq_idx]:
                 length = max(length, sample.shape[self.seq_dim])
-        n_batch_items = len(batch)
         for i in range(len(batch)):
-            for j in range(n_batch_items):
-                if j >= len(pad_val) or pad_val[j] is None:
-                    new_batch[j].append(batch[i][j])
-                else:
-                    new_shape = list(batch[i][j].shape)
-                    new_shape[seq_dim] = length - new_shape[seq_dim]
-                    pad_tensor = torch.full(size=new_shape, fill_value=pad_val[j])
-                    new_batch[j].append(torch.concat([batch[i][j], pad_tensor], dim=seq_dim))
-        return new_batch
+            if i >= len(self.pad_val) or self.pad_val[i] is None:
+                continue
 
-def pad_to_len(batch: List[Tuple[torch.Tensor]], pad_val: List, length: int = None, batch_seq_idx: int = None, seq_dim: int = 0) -> Tuple:
-    """
-    Pads a batch of tensors to a certain length, or to maximum tensor length.
-
-    Parameters:
-    - batch: Batch of tuple of tensors. E.g. (input sequence, output sequence, weights) in MLM task.
-    - batch_seq_idx: When length is none and padding to maximum length of tensor in batch, this \
-    parameter defines which batch index to find maximum length for.
-    - length: Length of the resulting tensors. If none, pads to maximum length of tensor in batch.
-    - pad_val: Padding values to add to tensors to make them the specified length. Length of list \
-    should be at most the length of each tuple in batch. If None value is used in pad_val, then that \
-    corresponding tensor in batch tuples will not be padded to length.
-    - seq_dim: Tensor dimension of the sequence to pad.
-    """
-    if length is None:
-        if batch_seq_idx is None:
-            raise Exception("batch_seq_idx cannot be none if length is none")
-        length = 0
-        for sample in batch:
-            length = max(length, sample[batch_seq_idx].shape[seq_dim])
-
-    n_batch_items = len(batch[0])
-    new_batch = [[] for _ in range(n_batch_items)]
-    for i in range(len(batch)):
-        for j in range(n_batch_items):
-            if j >= len(pad_val) or pad_val[j] is None:
-                new_batch[j].append(batch[i][j])
-            else:
+            for j in range(len(batch[i])):
                 new_shape = list(batch[i][j].shape)
-                new_shape[seq_dim] = length - new_shape[seq_dim]
-                pad_tensor = torch.full(size=new_shape, fill_value=pad_val[j])
-                new_batch[j].append(torch.concat([batch[i][j], pad_tensor], dim=seq_dim))
-    return new_batch
+                new_shape[self.seq_dim] = length - new_shape[self.seq_dim]
+                pad_tensor = torch.full(size=new_shape, fill_value=self.pad_val[i])
+                batch[i][j] = torch.concat([batch[i][j], pad_tensor], dim=self.seq_dim)
+        return batch
+
+
+class ExpandTensorCollator:
+    def __init__(self, expand_idxs: Union[int, List[int]] = None, expand_dim: int = 0) -> None:
+        """
+        Creates a new tensor dim in a selected dimension (of size 1).
+
+        Parameters:
+        - expand_idxs: The indexes in batch that need to be expanded. \
+            None means all indexes are expanded.
+        - expand_dim: The tensor dimension to expand on.
+        """
+        if type(expand_idxs) is int:
+            expand_idxs = [expand_idxs]
+
+        self.expands_idxs = expand_idxs
+        self.expand_dim = expand_dim
+    
+    def __call__(self, batch: Tuple[List[torch.Tensor]]) -> Tuple[List[torch.Tensor]]:
+        for i in range(len(batch)):
+            if self.expands_idxs is None or i in self.expand_idxs:
+                for j in range(len(batch[i])):
+                    batch[i][j] = torch.unsqueeze(batch[i][j], dim=self.expand_dim)
+        return batch
+
+
+class ConcatTensorCollator:
+    def __init__(self, concat_idxs: Union[int, List[int]] = None, concat_dim: int = 0) -> None:
+        """
+        Concatenates a batch of tensors along a selected dimension.
+
+        Parameters:
+        - concat_idxs: The indexes in batch where tensors will be concatenated. \
+            None means all indexes are concatenated.
+        - concat_dim: The tensor dimension to concatenate on.
+        """
+        if type(concat_idxs) is int:
+            concat_idxs = [concat_idxs]
+        
+        self.concat_idxs = concat_idxs
+        self.concat_dim = concat_dim
+    
+    def __call__(self, batch: Tuple[List[torch.Tensor]]) -> Tuple[torch.Tensor]:
+        new_batch = []
+        for i in range(len(batch)):
+            if self.concat_idxs is None or i in self.concat_idxs:
+                tmp_batch = torch.concat(batch[i], dim=self.concat_dim)
+            else:
+                tmp_batch = batch[i]
+            new_batch.append(tmp_batch)
+    
+        return tuple(new_batch)
 
 
 class CSVDataset:
@@ -379,37 +519,8 @@ class SMILESDataLoader:
         return xs, ys
 
     def _encode_seq(self, seq: str) -> List[int]:
-        return encode_seq(seq, self.model_str2num, self.vocab_str2num, self.prepend, self.append, unk_token=self.model_unk_token, use_selfies=self.use_selfies)
-    
-
-def expand_tensor_dim(batch: List[List[torch.Tensor]], expand_idxs: Union[int, List[int]], expand_dim: int = 0):
-    if type(expand_idxs) is int:
-        expand_idxs = [expand_idxs]
-    
-    for i in range(len(batch)):
-        if i in expand_idxs:
-            for j in range(len(batch[i])):
-                batch[i][j] = torch.unsqueeze(batch[i][j], dim=expand_dim)
-    
-    return batch
-
-def concat_tensors(batch: List[List[torch.Tensor]], concat_idxs: Union[int, List[int]], concat_dim: int = 0):
-    """
-    Concatenate a batch of tensors together.
-    
-    Parameters:
-    - batch: Batch of list of tensors. E.g. (input sequence, output sequence, weights) in MLM task.
-    - concat_idxs: Batch indices of tensors to concatenate along concat_dim.
-    - concat_dim: Tensor dimension for concatenation.
-    """
-    if type(concat_idxs) is int:
-        concat_idxs = [concat_idxs]
-    
-    for i in range(len(batch)):
-        if i in concat_idxs:
-            batch[i] = torch.concat(batch[i], dim=concat_dim)
-    
-    return batch
+        return encode_seq(seq, self.model_str2num, self.vocab_str2num, self.prepend, self.append, 
+                          unk_token=self.model_unk_token, use_selfies=self.use_selfies)
 
 
 if __name__ == "__main__":
@@ -417,14 +528,21 @@ if __name__ == "__main__":
     model_str2num, selfies_str2num = get_encoders(selfies_vocab, ['[PAD]', '[UNK]', '[MASK]', '[CLS]'])
     dataset = CSVDataset('/media/nick/Dataset/MolMIM/data/allmolgen_255maxlen_cano.csv')
 
-    mlm_collate = MaskedLanguageModelling(mask_token_encoding=model_str2num['[MASK]'], 
-                                  vocab_size=len(model_str2num) + len(selfies_str2num))
+    mlm_collate = MaskedLanguageModellingCollator(mask_token_encoding=model_str2num['[MASK]'], 
+                                                    vocab_size=len(model_str2num) + len(selfies_str2num))
 
-    dataloader = SMILESDataLoader(dataset, model_str2num, selfies_str2num, shuffle=True, use_selfies=False, n_partitions_loaded=10, batch_size=5, prepend_tokens_to_seq=['[CLS]'],
-                                  collate_fns=[mlm_collate])
+    pad_collate = PadToLenCollator([model_str2num['[PAD]'], model_str2num['[PAD]'], 0])
+
+    expand_tensor_collate = ExpandTensorCollator()
+    concat_collate = ConcatTensorCollator()
+
+    dataloader = SMILESDataLoader(dataset, model_str2num, selfies_str2num, shuffle=True, use_selfies=True, 
+                                  batch_size=5, prepend_tokens_to_seq=['[CLS]'],
+                                  collate_fns=[mlm_collate, pad_collate, expand_tensor_collate, concat_collate])
 
     for batch in tqdm(dataloader):
-        print(batch)
+        for t in batch:
+            print(t.shape)
         exit(1)
 
     for batch in tqdm(dataloader):
