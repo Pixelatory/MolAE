@@ -4,7 +4,9 @@ from functools import wraps
 import torch.nn.functional as F
 from torchinfo import summary
 #from cond_pixelcnn.utils.nn import NonLinear
+from loss import recon_loss, vae_loss
 from transformer import TransformerDecoderLayer, TransformerEncoderLayer
+from utils import reparameterize
 
 '''
     Implementation assisted by https://github.com/lucidrains/perceiver-pytorch and https://arxiv.org/pdf/2103.03206.pdf
@@ -44,6 +46,9 @@ class PerceiverBART(nn.Module):
                  average_latent: bool = False,
                  bias: bool = True, pad_token_idx: int = 0):
         super().__init__()
+        #TODO: positional encoding/positional embedding
+        #TODO: tie weights of output linear projection with embedding?
+
         # DECODER
         self.decoder_layers = nn.ModuleList()
         for _ in range(n_decoder_layers):
@@ -103,58 +108,64 @@ class PerceiverBART(nn.Module):
         out = out[1]
 
         return self.lm_head(out)
+    
+    def loss_function(self, outputs, labels, weights=None):
+        return recon_loss(outputs, labels, weights)
 
 
 class PerceiverBARTVAE(PerceiverBART):
-    def __init__(self, vocab_size: int, d_model: int, nhead: int, 
-                 num_encoder_layers: int, num_decoder_layers: int, 
-                 latent_dim: int, num_latent_vecs: int, 
-                 dim_feedforward: int, weight_tie_layers: bool, 
-                 padding_idx: int = 0):
-        super().__init__(vocab_size, d_model, nhead, num_encoder_layers, num_decoder_layers, latent_dim, num_latent_vecs, dim_feedforward, weight_tie_layers, padding_idx)
+    def __init__(self, vocab_size: int, d_model: int, n_heads: int, 
+                 n_encoder_layers: int, n_decoder_layers: int, 
+                 latent_dim: int, n_latent_vecs: int, 
+                 dim_feedforward: int, weight_tie_layers: bool,
+                 dropout: float, pre_norm: bool = False,
+                 activation_fn: nn.Module = nn.ReLU,
+                 norm_fn: nn.Module = nn.LayerNorm,
+                 average_latent: bool = False, bias: bool = True,
+                 kld_weight: float = 1., recon_weight: float = 1., 
+                 pad_token_idx: int = 0):
+        super().__init__(vocab_size, d_model, n_heads, n_encoder_layers, 
+                         n_decoder_layers, latent_dim, n_latent_vecs, 
+                         dim_feedforward, weight_tie_layers, dropout,
+                         pre_norm, activation_fn, norm_fn, average_latent, 
+                         bias, pad_token_idx)
+        self.kld_weight = kld_weight
+        self.recon_weight = recon_weight
+        self.fc_mean = nn.Linear(latent_dim, latent_dim, bias=bias)
+        self.fc_var = nn.Linear(latent_dim, latent_dim, bias=bias)
 
-        self.fc_mean = nn.Linear(latent_dim, latent_dim)
-        self.fc_var = nn.Linear(latent_dim, latent_dim)
-
-    def reparameterize(self, mu, log_var):
-        """
-        From: https://github.com/AntixK/PyTorch-VAE/blob/master/models/vanilla_vae.py#L107
-
-        Reparameterization trick to sample from N(mu, var) from
-        N(0,1).
-        :param mu: (Tensor) Mean of the latent Gaussian [B x D]
-        :param logvar: (Tensor) Standard deviation of the latent Gaussian [B x D]
-        :return: (Tensor) [B x D]
-        """
-        std = torch.exp(0.5 * log_var)
-        eps = torch.randn_like(std)
-        return eps * std + mu
-
-    def forward(self, x):
+    def forward(self, x, mask=None):
         x_emb = self.embedding(x)
 
         batch_size, _, _ = x_emb.shape
         latent = self.latent.repeat(batch_size, 1, 1)
 
+        memory = [x_emb, latent]
         for layer in self.encoder_layers:
-            memory = layer(x_emb, latent)
+            memory = [layer(*memory, mask=mask)]
+        memory = memory[0]
         
-        print('mem', memory.shape)
+        if self.average_latent:
+            memory = torch.mean(memory, dim=1).unsqueeze(1)
 
         mu = self.fc_mean(memory)
         log_var = self.fc_var(memory)
-        z = self.reparameterize(mu, log_var)
-
-        print('z', z.shape)
+        z = reparameterize(mu, log_var)
+        #print(mu.shape, log_var.shape, z.shape)
 
         causal_mask = nn.Transformer.generate_square_subsequent_mask(x.shape[-1])
-        return self.decoder(tgt=x_emb, memory=z, tgt_mask=causal_mask), mu, log_var
+        out = [z, x_emb]
+        for layer in self.decoder_layers:
+            out = [memory, layer(*out)]
+        out = out[1]
 
-    def loss_function(self, x, mu, log_var, y):
-        recon_loss = F.cross_entropy(x, y)
-        kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
+        return self.lm_head(out), z, mu, log_var
+
+    def loss_function(self, outputs, labels, weights=None):
+        outputs, _, mu, log_var = outputs
+        return vae_loss(outputs, labels, log_var, mu, weights, self.kld_weight, self.recon_weight)
         
-class PerceiverBARTAMIM(PerceiverBART):
+class PerceiverBARTAMIM(PerceiverBARTVAE):
     def loss_function(self, x, mu, log_var, y):
         # TODO: must implement log standard normal to get q(x)
         # TODO: must get marginal prior q(x) = log(p(x|z)) + log(p(z)) - log(q(z|x)) = log decoder + log prior - log encoder
@@ -168,8 +179,9 @@ if __name__ == "__main__":
     LAYERS = 512
     BATCH = 10
     SEQLEN = 26
-
+    '''
     model = PerceiverBART(VOCAB, HIDDEN, NHEAD, LAYERS, LAYERS, 64, 5, 1024, False, 0.1)
     summary(model)
     src = torch.randint(low=0, high=VOCAB, size=(BATCH, SEQLEN))
     print(model(src).shape)
+    '''

@@ -1,7 +1,11 @@
 from typing import Tuple
 import torch
+from rdkit import Chem
+import numpy as np
+import inspect
 
 SMI_REGEX_PATTERN = "(\[[^\]]+]|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#||\+|\\\\\/|:||@|\?|>|\*|\$|\%[0–9]{2}|[0-9])"
+
 
 def create_causal_mask(batch_size: int, seq_len: int) -> torch.Tensor:
     """
@@ -44,3 +48,55 @@ def combine_masks(*masks: Tuple[torch.Tensor], method: str = 'union') -> torch.T
             combined_mask = torch.logical_xor(combined_mask, mask)
     
     return combined_mask.int()
+
+
+def reparameterize(mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
+        """
+        From: https://github.com/AntixK/PyTorch-VAE/blob/master/models/vanilla_vae.py#L107
+
+        Reparameterization trick to sample from N(mu, var) from N(0,1).
+
+        Parameters:
+        - mu: Mean of the latent Gaussian (batch_size x d_model)
+        - logvar: (Tensor) Standard deviation of the latent Gaussian (batch_size x d_model)
+        """
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return eps * std + mu
+
+
+def log_normal_diag(x, mu, log_var, average=False, dim=None):
+    """
+    From: https://github.com/seraphlabs-ca/MIM/blob/master/src/cond_pixelcnn/utils/distributions.py#L10
+    """
+    log_normal = -0.5 * (log_var + torch.pow(x - mu, 2) / torch.exp(log_var))
+    if average:
+        return torch.mean(log_normal, dim)
+    else:
+        return torch.sum(log_normal, dim)
+
+
+def randomize_smiles(smi: str, generator: np.random.Generator = None) -> str:
+    m = Chem.MolFromSmiles(smi)
+    ans = list(range(m.GetNumAtoms()))
+    if generator is not None:
+        generator.shuffle(ans)
+    else:
+        np.random.shuffle(ans)
+    nm = Chem.RenumberAtoms(m, ans)
+    smiles = Chem.MolToSmiles(nm, canonical=False)
+    return smiles
+
+
+def canonical_smiles(smi: str) -> str:
+    m = Chem.MolFromSmiles(smi)
+    smiles = Chem.MolToSmiles(m, canonical=True)
+    return smiles
+
+
+def has_argument(fn: callable, arg_name: str) -> bool:
+    """
+    Check if a function has an argument with a specific name.
+    """
+    signature = inspect.signature(fn)
+    return arg_name in signature.parameters

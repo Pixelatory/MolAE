@@ -1,7 +1,7 @@
 import torch.nn as nn
 from dataset import CSVDataset, SMILESDataLoader, concat_tensors, expand_tensor_dim, get_encoders, load_vocab_from_file, pad_to_len
 from loss import recon_loss
-from perceiver import PerceiverBART
+from perceiver import PerceiverBART, PerceiverBARTVAE
 import torch
 import torch.nn.functional as F
 
@@ -22,7 +22,7 @@ if __name__ == "__main__":
     pre_norm = True
     activation_fn = nn.GELU
     norm_fn = nn.LayerNorm
-    average_latent = True
+    average_latent = False
     bias = True
 
     batch_size = 64
@@ -38,7 +38,7 @@ if __name__ == "__main__":
                                   mlm_prob_overall=0.0, collate_fns=[pad_fn, expand_fn, concat_fn])
 
     
-    model = PerceiverBART(len(model_str2num) + len(vocab_str2num), d_model, n_heads, n_encoder_layers, n_decoder_layers,
+    model = PerceiverBARTVAE(len(model_str2num) + len(vocab_str2num), d_model, n_heads, n_encoder_layers, n_decoder_layers,
                           latent_dim, n_latent_vecs, dim_feedforward, weight_tie_layers, dropout, pre_norm, activation_fn,
                           norm_fn, average_latent, bias)
     
@@ -49,13 +49,18 @@ if __name__ == "__main__":
         last_loss = 0.
 
         for i, batch in enumerate(dataloader):
-            inputs, labels = batch
+            if len(batch) == 2:
+                inputs, labels = batch
+                weights = None
+            else:
+                inputs, labels, weights = batch
             
             optimizer.zero_grad()
+            
+            outputs = model(inputs)
 
-            outputs = F.softmax(model(inputs), dim=-1)
-
-            loss = recon_loss(outputs, labels)
+            loss = model.loss_function(outputs, labels, weights)
+            print(loss)
             loss.backward()
 
             optimizer.step()
